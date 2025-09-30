@@ -9,6 +9,10 @@
 			body: JSON.stringify({ message: data })
 		});
 
+		if (response.ok) {
+			data = '';
+			await retrieveData();
+		}
 	}
 
 	async function retrieveData() {
