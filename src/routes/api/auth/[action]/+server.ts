@@ -1,6 +1,6 @@
 import type { RequestHandler } from '@sveltejs/kit';
 
-const POST_ACTIONS = new Set(['register', 'login', 'logout']);
+const POST_ACTIONS = new Set(['register', 'login', 'logout', 'profile']);
 const SESSION_COOKIE = 'session_token';
 const ONE_WEEK_SECONDS = 60 * 60 * 24 * 7;
 
@@ -61,15 +61,20 @@ export const POST: RequestHandler = async ({ request, platform, params, cookies 
 	let bodyText = await request.text();
 	const url = new URL(request.url);
 
-	if (action === 'logout') {
-		let parsed = parseJson(bodyText) ?? {};
-		if (parsed && typeof parsed === 'object' && !parsed.token) {
+	if (action === 'logout' || action === 'profile') {
+		let parsed = parseJson(bodyText);
+		if (!parsed || typeof parsed !== 'object') {
+			parsed = {};
+		}
+
+		if (!('token' in parsed) || !parsed.token) {
 			const cookieToken = cookies.get(SESSION_COOKIE);
 			if (cookieToken) {
 				parsed.token = cookieToken;
-				bodyText = JSON.stringify(parsed);
 			}
 		}
+
+		bodyText = JSON.stringify(parsed);
 	}
 	const doUrl = new URL(`https://durable-object/${action}`);
 
@@ -89,12 +94,12 @@ export const POST: RequestHandler = async ({ request, platform, params, cookies 
 	}
 	headers.set('Cache-Control', 'no-store');
 
-	if (action === 'login') {
-		if (upstreamResponse.ok && payload?.token) {
-			cookies.set(SESSION_COOKIE, payload.token, buildCookieOptions(url));
-		} else {
-			cookies.delete(SESSION_COOKIE, buildDeleteCookieOptions(url));
-		}
+	if ((action === 'login' || action === 'profile') && upstreamResponse.ok && payload?.token) {
+		cookies.set(SESSION_COOKIE, payload.token, buildCookieOptions(url));
+	}
+
+	if (action === 'login' && (!upstreamResponse.ok || !payload?.token)) {
+		cookies.delete(SESSION_COOKIE, buildDeleteCookieOptions(url));
 	}
 
 	if (action === 'logout' && upstreamResponse.ok) {
@@ -109,9 +114,12 @@ export const POST: RequestHandler = async ({ request, platform, params, cookies 
 	});
 };
 
+
+const GET_ACTIONS = new Set(['session', 'profile']);
+
 export const GET: RequestHandler = async ({ request, platform, params, url, cookies }) => {
 	const action = (params as Record<string, string>).action?.toLowerCase();
-	if (action !== 'session') {
+	if (!action || !GET_ACTIONS.has(action)) {
 		return notFound();
 	}
 
@@ -149,10 +157,15 @@ export const GET: RequestHandler = async ({ request, platform, params, url, cook
 	}
 
 	const requestUrl = new URL(request.url);
-	if (upstreamResponse.ok && payload?.success !== false && payload?.profile) {
-		cookies.set(SESSION_COOKIE, token, buildCookieOptions(requestUrl));
-		if (payload && typeof payload === 'object') {
-			(payload as Record<string, unknown>).token = token;
+	if (upstreamResponse.ok && payload?.success !== false) {
+		const nextToken = (payload && typeof payload === 'object' && typeof payload.token === 'string')
+			? (payload as { token: string }).token
+			: token;
+		if (nextToken) {
+			cookies.set(SESSION_COOKIE, nextToken, buildCookieOptions(requestUrl));
+			if (payload && typeof payload === 'object') {
+				(payload as Record<string, unknown>).token = nextToken;
+			}
 		}
 	} else if (upstreamResponse.status === 401) {
 		cookies.delete(SESSION_COOKIE, buildDeleteCookieOptions(requestUrl));

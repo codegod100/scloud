@@ -5,7 +5,56 @@ const SESSIONS_PREFIX = 'session:';
 const PROVIDER_LOCAL = 'local';
 const PROVIDER_GOOGLE = 'google';
 
+const MAX_DISPLAY_NAME_LENGTH = 64;
+const MAX_BIO_LENGTH = 400;
+
+const getSessionKey = (token) => `${SESSIONS_PREFIX}${token}`;
+
 const encoder = new TextEncoder();
+
+const clampLength = (value, max) => (value.length > max ? value.slice(0, max) : value);
+
+const toOptionalString = (value) => (value == null ? '' : String(value));
+
+function sanitizeDisplayName(value, fallback) {
+	const base = toOptionalString(value).trim();
+	if (!base) {
+		const fallbackValue = toOptionalString(fallback).trim() || 'User';
+		return clampLength(fallbackValue, MAX_DISPLAY_NAME_LENGTH);
+	}
+	return clampLength(base, MAX_DISPLAY_NAME_LENGTH);
+}
+
+function sanitizeBio(value) {
+	const base = toOptionalString(value).trim();
+	return clampLength(base, MAX_BIO_LENGTH);
+}
+
+function buildProfile(provider, userId, record = {}, session = {}) {
+	const username = session.username ?? record.username ?? userId ?? '';
+	const displayName = sanitizeDisplayName(record.displayName ?? session.displayName ?? username, username);
+	const email = record.email ?? session.email;
+	const picture = record.picture ?? session.picture;
+	const bio = sanitizeBio(record.bio ?? session.bio ?? '');
+
+	const profile = {
+		provider,
+		userId,
+		username,
+		displayName,
+		bio
+	};
+
+	if (email) {
+		profile.email = email;
+	}
+
+	if (picture) {
+		profile.picture = picture;
+	}
+
+	return profile;
+}
 
 async function hashPassword(password) {
 	const hashed = await crypto.subtle.digest('SHA-256', encoder.encode(password));
@@ -60,8 +109,16 @@ export class MyDurableObject {
 				return await this.handleGoogleLogin(request);
 			}
 
+			if (request.method === 'POST' && pathname === '/profile') {
+				return await this.handleProfileUpdate(request);
+			}
+
 			if (request.method === 'GET' && pathname === '/session') {
 				return await this.handleSession(searchParams);
+			}
+
+			if (request.method === 'GET' && pathname === '/profile') {
+				return await this.handleProfileGet(searchParams);
 			}
 
 			return error('Endpoint not found', 404);
@@ -91,11 +148,15 @@ export class MyDurableObject {
 		}
 
 		const passwordHash = await hashPassword(password);
+		const displayName = sanitizeDisplayName(trimmedUsername, trimmedUsername);
 		await this.state.storage.put(userKey, {
 			provider: PROVIDER_LOCAL,
 			username: trimmedUsername,
+			displayName,
+			bio: '',
 			passwordHash,
-			createdAt: Date.now()
+			createdAt: Date.now(),
+			updatedAt: Date.now()
 		});
 
 		// Clean up any legacy key if it exists.
@@ -124,12 +185,19 @@ export class MyDurableObject {
 			return error('Invalid credentials', 401);
 		}
 
+		userRecord.displayName = sanitizeDisplayName(userRecord.displayName, trimmedUsername);
+		userRecord.bio = sanitizeBio(userRecord.bio ?? '');
+		userRecord.lastLoginAt = Date.now();
+		userRecord.updatedAt = Date.now();
+		await this.state.storage.put(userKey, userRecord);
+
+		const profile = buildProfile(PROVIDER_LOCAL, trimmedUsername, userRecord, {
+			username: trimmedUsername
+		});
+
 		const session = await this.createSession({
-			provider: PROVIDER_LOCAL,
-			userId: trimmedUsername,
-			username: trimmedUsername,
-			displayName: trimmedUsername,
-			createdAt: Date.now()
+			...profile,
+			authenticatedAt: Date.now()
 		});
 
 		return json({
@@ -157,16 +225,32 @@ export class MyDurableObject {
 			return error('Session token is required', 400);
 		}
 
-		const session = await this.state.storage.get(`${SESSIONS_PREFIX}${token}`);
+		const session = await this.getSession(token);
 		if (!session) {
 			return error('Session not found', 401);
+		}
+
+		const provider = session.provider ?? PROVIDER_LOCAL;
+		const userId = session.userId ?? session.username;
+		const userRecord = userId ? await this.getUserRecord(provider, userId) : null;
+		const profile = buildProfile(provider, userId, userRecord ?? {}, session);
+
+		if (
+			session.displayName !== profile.displayName ||
+			sanitizeBio(session.bio ?? '') !== profile.bio ||
+			session.username !== profile.username ||
+			session.email !== profile.email ||
+			session.picture !== profile.picture
+		) {
+			await this.updateSession(token, profile);
 		}
 
 		return json({
 			success: true,
 			authenticated: true,
-			username: session.displayName ?? session.username ?? '',
-			profile: session
+			username: profile.displayName || profile.username || '',
+			profile,
+			token
 		});
 	}
 
@@ -193,27 +277,41 @@ export class MyDurableObject {
 		}
 
 		const email = tokenInfo.email;
-		const displayName = tokenInfo.name || email || 'Google User';
-		const picture = tokenInfo.picture;
-
 		const userKey = buildUserKey(PROVIDER_GOOGLE, sub);
-		await this.state.storage.put(userKey, {
+		const existingRecord = await this.state.storage.get(userKey);
+
+		const displayName = sanitizeDisplayName(
+			existingRecord?.displayName ?? tokenInfo.name,
+			email || 'Google User'
+		);
+		const picture = tokenInfo.picture ?? existingRecord?.picture;
+		const bio = sanitizeBio(existingRecord?.bio ?? '');
+
+		const userRecord = {
 			provider: PROVIDER_GOOGLE,
 			userId: sub,
 			email,
 			displayName,
 			picture,
-			lastLoginAt: Date.now()
+			bio,
+			lastLoginAt: Date.now(),
+			updatedAt: Date.now()
+		};
+
+		await this.state.storage.put(userKey, {
+			...existingRecord,
+			...userRecord
+		});
+
+		const profile = buildProfile(PROVIDER_GOOGLE, sub, userRecord, {
+			username: email,
+			email,
+			picture
 		});
 
 		const session = await this.createSession({
-			provider: PROVIDER_GOOGLE,
-			userId: sub,
-			username: email,
-			displayName,
-			email,
-			picture,
-			createdAt: Date.now()
+			...profile,
+			authenticatedAt: Date.now()
 		});
 
 		return json({
@@ -228,12 +326,221 @@ export class MyDurableObject {
 
 	async createSession(payload) {
 		const sessionToken = generateToken();
-		await this.state.storage.put(`${SESSIONS_PREFIX}${sessionToken}`, payload);
+		const now = Date.now();
+		const usernameFallback = payload.username ?? payload.userId ?? '';
+		const displayName = sanitizeDisplayName(payload.displayName, usernameFallback);
+		const bio = sanitizeBio(payload.bio ?? '');
+		const provider = payload.provider ?? PROVIDER_LOCAL;
+		const userId = payload.userId ?? usernameFallback;
+
+		const sessionPayload = {
+			provider,
+			userId,
+			username: usernameFallback,
+			displayName,
+			bio,
+			authenticatedAt: payload.authenticatedAt ?? now,
+			createdAt: payload.createdAt ?? now,
+			updatedAt: now
+		};
+
+		if (payload.email) {
+			sessionPayload.email = payload.email;
+		}
+
+		if (payload.picture) {
+			sessionPayload.picture = payload.picture;
+		}
+
+		await this.state.storage.put(getSessionKey(sessionToken), sessionPayload);
 
 		return {
 			token: sessionToken,
-			payload
+			payload: sessionPayload
 		};
+	}
+
+	async getSession(token) {
+		if (!token) {
+			return null;
+		}
+		return this.state.storage.get(getSessionKey(token));
+	}
+
+	async updateSession(token, updates) {
+		const key = getSessionKey(token);
+		const session = await this.state.storage.get(key);
+		if (!session) {
+			return null;
+		}
+
+		const merged = { ...session };
+
+		if (updates.provider) {
+			merged.provider = updates.provider;
+		}
+
+		if (updates.userId) {
+			merged.userId = updates.userId;
+		}
+
+		if (updates.username) {
+			const username = toOptionalString(updates.username).trim();
+			if (username) {
+				merged.username = username;
+			}
+		}
+
+		if (updates.displayName !== undefined) {
+			merged.displayName = sanitizeDisplayName(updates.displayName, merged.username ?? merged.displayName ?? 'User');
+		}
+
+		if (updates.bio !== undefined) {
+			merged.bio = sanitizeBio(updates.bio);
+		}
+
+		if (updates.email !== undefined) {
+			if (updates.email) {
+				merged.email = updates.email;
+			} else {
+				delete merged.email;
+			}
+		}
+
+		if (updates.picture !== undefined) {
+			if (updates.picture) {
+				merged.picture = updates.picture;
+			} else {
+				delete merged.picture;
+			}
+		}
+
+		merged.updatedAt = Date.now();
+
+		await this.state.storage.put(key, merged);
+		return merged;
+	}
+
+	async getUserRecord(provider, userId) {
+		if (!userId) {
+			return null;
+		}
+
+		const userKey = buildUserKey(provider, userId);
+		let record = await this.state.storage.get(userKey);
+
+		if (!record && provider === PROVIDER_LOCAL) {
+			const legacyKey = getLegacyLocalKey(userId);
+			const legacyRecord = await this.state.storage.get(legacyKey);
+			if (legacyRecord) {
+				record = legacyRecord;
+				await this.state.storage.put(userKey, record);
+				await this.state.storage.delete(legacyKey);
+			}
+		}
+
+		return record;
+	}
+
+	async buildProfileFromSession(session) {
+		const provider = session.provider ?? PROVIDER_LOCAL;
+		const userId = session.userId ?? session.username;
+		if (!userId) {
+			return null;
+		}
+
+		const userRecord = await this.getUserRecord(provider, userId);
+		return buildProfile(provider, userId, userRecord ?? {}, session);
+	}
+
+	async handleProfileGet(searchParams) {
+		const token = searchParams.get('token');
+		if (!token) {
+			return error('Session token is required', 400);
+		}
+
+		const session = await this.getSession(token);
+		if (!session) {
+			return error('Session not found', 401);
+		}
+
+		const profile = await this.buildProfileFromSession(session);
+		if (!profile) {
+			return error('User profile not found', 404);
+		}
+
+		return json({ success: true, profile, token });
+	}
+
+	async handleProfileUpdate(request) {
+		const { token, displayName, bio } = await this.readJson(request);
+
+		if (!token) {
+			return error('Session token is required');
+		}
+
+		const session = await this.getSession(token);
+		if (!session) {
+			return error('Session not found', 401);
+		}
+
+		const provider = session.provider ?? PROVIDER_LOCAL;
+		const userId = session.userId ?? session.username;
+		if (!userId) {
+			return error('Unable to resolve profile owner', 400);
+		}
+
+		const userKey = buildUserKey(provider, userId);
+		const existingRecord = await this.getUserRecord(provider, userId);
+		if (!existingRecord) {
+			return error('User profile not found', 404);
+		}
+
+		const userRecord = { ...existingRecord };
+
+		let hasChanges = false;
+
+		if (displayName !== undefined) {
+			const nextDisplayName = sanitizeDisplayName(displayName, userRecord.username ?? session.username ?? userId);
+			if (nextDisplayName !== userRecord.displayName) {
+				hasChanges = true;
+				userRecord.displayName = nextDisplayName;
+			}
+		}
+
+		if (bio !== undefined) {
+			const nextBio = sanitizeBio(bio);
+			if (nextBio !== sanitizeBio(userRecord.bio ?? '')) {
+				hasChanges = true;
+				userRecord.bio = nextBio;
+			}
+		}
+
+		if (!hasChanges) {
+			const profile = buildProfile(provider, userId, userRecord, session);
+			return json({ success: true, message: 'Profile is already up to date.', profile, token });
+		}
+
+		userRecord.provider = provider;
+		if (provider === PROVIDER_LOCAL && !userRecord.username) {
+			userRecord.username = userId;
+		}
+		userRecord.updatedAt = Date.now();
+		await this.state.storage.put(userKey, userRecord);
+
+		const updatedSession = await this.updateSession(token, {
+			displayName: userRecord.displayName,
+			bio: userRecord.bio
+		});
+
+		const profile = buildProfile(provider, userId, userRecord, updatedSession ?? session);
+
+		return json({
+			success: true,
+			message: 'Profile updated successfully.',
+			profile,
+			token
+		});
 	}
 
 	async verifyGoogleCredential(credential) {
