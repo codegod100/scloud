@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 
 	const SESSION_STORAGE_KEY = 'scloud-auth-token';
@@ -7,11 +8,45 @@
 	let registerPassword = $state('');
 	let loginUsername = $state('');
 	let loginPassword = $state('');
+	type SessionProfile = {
+		provider?: string;
+		username?: string;
+		displayName?: string;
+		email?: string;
+		picture?: string;
+		userId?: string;
+	};
+
+	type GoogleCredentialResponse = {
+		credential?: string;
+		select_by?: string;
+	};
+
+	declare global {
+		interface Window {
+			google?: {
+				accounts?: {
+					id?: {
+						initialize: (config: Record<string, unknown>) => void;
+						renderButton: (element: HTMLElement, options: Record<string, unknown>) => void;
+						prompt: () => void;
+					};
+				};
+			};
+		}
+	}
+
 	let sessionToken = $state('');
 	let loggedInUser = $state('');
+	let sessionProfile = $state<SessionProfile | null>(null);
 	let statusMessage = $state('');
 	let statusIsError = $state(false);
 	let isBusy = $state(false);
+	let redirectTarget = $state('/dashboard');
+
+	const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+	let googleButtonContainer = $state<HTMLDivElement | null>(null);
+	let googleScriptPromise: Promise<void> | null = null;
 
 	const isLoggedIn = $derived(Boolean(sessionToken));
 
@@ -36,12 +71,21 @@
 	function resetSessionState() {
 		sessionToken = '';
 		loggedInUser = '';
+		sessionProfile = null;
 		clearPersistedSession();
 	}
 
 	function setStatus(message: string, isError = false) {
 		statusMessage = message;
 		statusIsError = isError;
+	}
+
+	function resolveRedirectTarget(candidate: string | null | undefined) {
+		if (!candidate || candidate === '/') {
+			return '/dashboard';
+		}
+
+		return candidate.startsWith('/') ? candidate : '/dashboard';
 	}
 
 	async function callAuth(action: string, init: RequestInit = {}) {
@@ -70,6 +114,155 @@
 		}
 
 		return payload;
+	}
+
+	function applySessionPayload(result: any, { persist = true }: { persist?: boolean } = {}) {
+		if (result?.token) {
+			sessionToken = result.token;
+		}
+
+		sessionProfile = (result?.profile as SessionProfile | undefined) ?? sessionProfile;
+		if (!sessionProfile) {
+			sessionProfile = result?.username
+				? {
+					provider: 'local',
+					displayName: result.username,
+					username: result.username
+				}
+				: null;
+		}
+
+		loggedInUser = sessionProfile?.displayName ?? result?.username ?? loggedInUser;
+
+		if (persist && sessionToken) {
+			persistSession(sessionToken);
+		}
+	}
+
+	function restoreSessionFromStorage() {
+		if (typeof localStorage === 'undefined') return;
+		try {
+			const storedToken = localStorage.getItem(SESSION_STORAGE_KEY);
+			if (storedToken) {
+				sessionToken = storedToken;
+			}
+		} catch (error) {
+			console.warn('Unable to restore session token from storage', error);
+		}
+	}
+
+	function ensureGoogleScript(): Promise<void> {
+		if (typeof window === 'undefined') {
+			return Promise.resolve();
+		}
+
+		if (window.google?.accounts?.id) {
+			return Promise.resolve();
+		}
+
+		if (googleScriptPromise) {
+			return googleScriptPromise;
+		}
+
+		googleScriptPromise = new Promise((resolve, reject) => {
+			const existing = document.getElementById('google-identity-services');
+			if (existing) {
+				const element = existing as HTMLScriptElement;
+				if (element.dataset.gisLoaded === 'true' || element.readyState === 'complete') {
+					resolve();
+					return;
+				}
+				element.addEventListener('load', () => {
+					element.dataset.gisLoaded = 'true';
+					resolve();
+				}, { once: true });
+				element.addEventListener(
+					'error',
+					() => reject(new Error('Failed to load Google Identity Services script.')),
+					{ once: true }
+				);
+				return;
+			}
+
+			const script = document.createElement('script');
+			script.id = 'google-identity-services';
+			script.src = 'https://accounts.google.com/gsi/client';
+			script.async = true;
+			script.defer = true;
+			script.onload = () => {
+				script.dataset.gisLoaded = 'true';
+				resolve();
+			};
+			script.onerror = () => reject(new Error('Failed to load Google Identity Services script.'));
+			document.head.appendChild(script);
+		});
+
+		return googleScriptPromise.finally(() => {
+			googleScriptPromise = null;
+		});
+	}
+
+	async function initGoogleSignIn() {
+		if (typeof window === 'undefined') {
+			return;
+		}
+
+		if (!GOOGLE_CLIENT_ID) {
+			console.warn('VITE_GOOGLE_CLIENT_ID is not defined. Google Sign-In will be disabled.');
+			return;
+		}
+
+		try {
+			await ensureGoogleScript();
+			const googleId = window.google?.accounts?.id;
+			if (!googleId) {
+				throw new Error('Google Identity Services failed to initialize.');
+			}
+
+			googleId.initialize({
+				client_id: GOOGLE_CLIENT_ID,
+				callback: handleGoogleCredential,
+				auto_select: false
+			});
+
+			if (googleButtonContainer) {
+				googleId.renderButton(googleButtonContainer, {
+					theme: 'outline',
+					size: 'large',
+					shape: 'pill',
+					text: 'signin_with',
+					width: 312
+				});
+			}
+
+			googleId.prompt();
+		} catch (error) {
+			console.error('Unable to initialise Google Sign-In', error);
+			setStatus('Google Sign-In is unavailable right now.', true);
+		}
+	}
+
+	async function handleGoogleCredential(response: GoogleCredentialResponse) {
+		if (!response?.credential) {
+			setStatus('Google sign-in did not return a credential.', true);
+			return;
+		}
+
+		isBusy = true;
+		try {
+			const result = await callAuth('google', {
+				method: 'POST',
+				body: JSON.stringify({ credential: response.credential })
+			});
+			applySessionPayload(result);
+			setStatus(result?.message ?? 'Signed in with Google.');
+			await goto(redirectTarget || '/dashboard');
+		} catch (error) {
+			resetSessionState();
+			setStatus(error instanceof Error ? error.message : 'Google sign-in failed.', true);
+		} finally {
+			isBusy = false;
+		}
 	}
 
 	async function registerUser() {
@@ -110,13 +303,10 @@
 				method: 'POST',
 				body: JSON.stringify({ username: loginUsername, password: loginPassword })
 			});
-			sessionToken = result?.token ?? '';
-			loggedInUser = result?.username ?? '';
+			applySessionPayload(result);
 			setStatus(result?.message ?? 'Login successful.');
-			if (sessionToken) {
-				persistSession(sessionToken);
-			}
 			loginPassword = '';
+			await goto(redirectTarget || '/dashboard');
 		} catch (error) {
 			resetSessionState();
 			setStatus(error instanceof Error ? error.message : 'Login failed.', true);
@@ -130,19 +320,17 @@
 		loginUser();
 	}
 
-	async function logoutUser() {
-		if (!sessionToken) {
-			setStatus('There is no active session to log out of.', true);
-			return;
-		}
 
+	async function logoutUser() {
 		isBusy = true;
 		try {
+			const payload = sessionToken ? { token: sessionToken } : {};
 			const result = await callAuth('logout', {
 				method: 'POST',
-				body: JSON.stringify({ token: sessionToken })
+				body: JSON.stringify(payload)
 			});
 			resetSessionState();
+			redirectTarget = '/dashboard';
 			setStatus(result?.message ?? 'Logged out successfully.');
 		} catch (error) {
 			setStatus(error instanceof Error ? error.message : 'Logout failed.', true);
@@ -151,7 +339,11 @@
 		}
 	}
 
-	async function refreshSession({ silent = false } = {}) {
+	async function refreshSession({
+		silent = false,
+		redirectOnSuccess = false,
+		redirectTo = '/dashboard'
+	} = {}) {
 		if (!sessionToken) {
 			if (!silent) {
 				setStatus('No session token available. Log in first.', true);
@@ -179,16 +371,27 @@
 				throw new Error(payload?.message ?? (text || 'Session lookup failed.'));
 			}
 
-			loggedInUser = payload?.username ?? '';
+			if (payload?.token) {
+				sessionToken = payload.token;
+			}
+
+			sessionProfile = (payload?.profile as SessionProfile | undefined) ?? sessionProfile;
+			loggedInUser = sessionProfile?.displayName ?? payload?.username ?? '';
 			if (!silent) {
+				const providerLabel = sessionProfile?.provider
+					? ` via ${sessionProfile.provider === 'google' ? 'Google' : sessionProfile.provider}`
+					: '';
 				setStatus(
 					loggedInUser
-						? `Authenticated as ${loggedInUser}.`
+						? `Authenticated as ${loggedInUser}${providerLabel}.`
 						: 'Session is active.'
 				);
 			}
 			if (sessionToken) {
 				persistSession(sessionToken);
+			}
+			if (redirectOnSuccess) {
+				await goto(redirectTo);
 			}
 		} catch (error) {
 			resetSessionState();
@@ -202,17 +405,17 @@
 		}
 	}
 
-		onMount(() => {
-			try {
-				const storedToken = localStorage.getItem(SESSION_STORAGE_KEY);
-				if (storedToken) {
-					sessionToken = storedToken;
-					refreshSession({ silent: true });
-				}
-			} catch (error) {
-				console.warn('Unable to restore session token from storage', error);
-			}
+	onMount(() => {
+		restoreSessionFromStorage();
+		if (typeof window !== 'undefined') {
+			redirectTarget = resolveRedirectTarget(new URL(window.location.href).searchParams.get('redirect'));
+		}
+		const target = redirectTarget || '/dashboard';
+		refreshSession({ silent: true, redirectOnSuccess: true, redirectTo: target }).catch(() => {
+			// Errors handled within refreshSession.
 		});
+		initGoogleSignIn();
+	});
 </script>
 
 <main class="layout">
@@ -267,12 +470,40 @@
 				<button type="submit" class="primary" disabled={isBusy}>Log in</button>
 			</form>
 		</div>
+
+			<div class="card google-card">
+				<h2>Continue with Google</h2>
+				<p class="subtext">Sign in without a password using your Google account.</p>
+				{#if GOOGLE_CLIENT_ID}
+					<div class="google-button" bind:this={googleButtonContainer}></div>
+					<p class="google-note">We only request your verified email and basic profile info.</p>
+				{:else}
+					<p class="google-missing">Google Sign-In is unavailable until a client ID is configured.</p>
+				{/if}
+			</div>
 	</section>
 
 	<section class="card">
 		<h2>Session status</h2>
 		{#if isLoggedIn}
-			<p class="session">Signed in as <strong>{loggedInUser}</strong></p>
+				<div class="session-meta">
+					{#if sessionProfile?.picture}
+						<img class="avatar" src={sessionProfile.picture} alt={loggedInUser} referrerpolicy="no-referrer" />
+					{/if}
+					<div>
+						<p class="session">
+							Signed in as <strong>{loggedInUser}</strong>
+							{#if sessionProfile?.provider}
+								<span class="provider-badge">
+									{sessionProfile.provider === 'google' ? 'Google' : sessionProfile.provider}
+								</span>
+							{/if}
+						</p>
+						{#if sessionProfile?.email && sessionProfile.email !== loggedInUser}
+							<p class="session-email">{sessionProfile.email}</p>
+						{/if}
+					</div>
+				</div>
 			<details>
 				<summary>Session token</summary>
 				<code>{sessionToken}</code>
@@ -335,6 +566,16 @@
 		gap: 1rem;
 	}
 
+	.google-card {
+		justify-content: center;
+		text-align: center;
+	}
+
+	.subtext {
+		margin: 0;
+		color: #52606d;
+	}
+
 	.card h2 {
 		margin: 0;
 		font-size: 1.3rem;
@@ -364,6 +605,23 @@
 		border-color: #6366f1;
 		box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.2);
 		background: #ffffff;
+	}
+
+	.google-button {
+		display: flex;
+		justify-content: center;
+	}
+
+	.google-note {
+		margin: 0;
+		font-size: 0.875rem;
+		color: #64748b;
+	}
+
+	.google-missing {
+		margin: 0;
+		font-size: 0.9rem;
+		color: #b91c1c;
 	}
 
 	button {
@@ -410,6 +668,39 @@
 	.session {
 		margin: 0;
 		color: #334155;
+	}
+
+	.session-meta {
+		display: flex;
+		align-items: center;
+		gap: 0.85rem;
+	}
+
+	.avatar {
+		width: 48px;
+		height: 48px;
+		border-radius: 50%;
+		object-fit: cover;
+		border: 2px solid rgba(148, 163, 184, 0.4);
+	}
+
+	.provider-badge {
+		display: inline-flex;
+		align-items: center;
+		gap: 0.25rem;
+		margin-left: 0.5rem;
+		padding: 0.2rem 0.55rem;
+		font-size: 0.75rem;
+		border-radius: 999px;
+		background: rgba(59, 130, 246, 0.12);
+		color: #2563eb;
+		text-transform: capitalize;
+	}
+
+	.session-email {
+		margin: 0.25rem 0 0;
+		color: #64748b;
+		font-size: 0.9rem;
 	}
 
 	code {
